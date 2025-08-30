@@ -1,0 +1,209 @@
+# corrected_legal_analyzer.py
+
+import streamlit as st
+from transformers import pipeline
+import spacy
+import docx, pdfplumber, re, os
+import tempfile
+
+# --- Page Configuration ---
+st.set_page_config(
+    page_title="Legal Document Analyzer",
+    page_icon="⚖️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- Sidebar ---
+with st.sidebar:
+    st.title("⚖️ CLAUSE ANALYSER ")
+    st.markdown("**Upload any legal document to analyze it**")
+    st.markdown("---")
+    uploaded = st.file_uploader("Upload PDF, DOCX, or TXT file", type=["pdf", "docx", "txt"])
+    st.markdown("---")
+    st.caption("Built with Streamlit & Transformers 🧑‍💻")
+    st.markdown(
+        f"<div style='text-align:center;'>"
+        f"<img src='https://img.icons8.com/ios-filled/50/000000/law.png' width=64/>"
+        f"</div>", unsafe_allow_html=True
+    )
+
+# --- Load NLP Models ---
+@st.cache_resource
+def load_nlp_models():
+    nlp = spacy.load("en_core_web_sm")
+    simplifier = pipeline("text2text-generation", model="google/flan-t5-small")
+    ner_pipeline = pipeline("ner", grouped_entities=True)
+    return nlp, simplifier, ner_pipeline
+
+with st.spinner(":rocket: Loading models... This may take a moment"):
+    nlp, simplifier, ner_pipeline = load_nlp_models()
+
+# --- File Parsing Utilities ---
+def parse_txt(file):
+    try:
+        return file.read().decode()
+    except:
+        # fallback fallback
+        return file.read()
+
+def parse_docx(file):
+    doc = docx.Document(file)
+    return "\n".join([para.text for para in doc.paragraphs])
+
+def parse_pdf(file):
+    with pdfplumber.open(file) as pdf:
+        texts = []
+        for p in pdf.pages:
+            txt = p.extract_text()
+            if txt:
+                texts.append(txt)
+        return "\n".join(texts)
+
+def extract_text(uploaded_file):
+    if uploaded_file.type == "text/plain":
+        return parse_txt(uploaded_file)
+    elif "word" in uploaded_file.type or uploaded_file.name.endswith(".docx"):
+        return parse_docx(uploaded_file)
+    elif "pdf" in uploaded_file.type:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tfile.write(uploaded_file.read())
+        tfile.close()
+        text = parse_pdf(tfile.name)
+        os.unlink(tfile.name)
+        return text
+    else:
+        return ""
+
+# --- Clause Extraction ---
+def get_clauses(text):
+    reg_pts = r"(\n\d+\.|\nSection \d+\.|\nClause \d+\.|\nArticle \d+\.)"
+    split = re.split(reg_pts, text)
+    clauses, clause = [], ""
+    for seg in split:
+        if re.match(reg_pts, seg):
+            if clause:
+                clauses.append(clause.strip())
+            clause = seg
+        else:
+            clause += seg
+    if clause:
+        clauses.append(clause.strip())
+    return [c for c in clauses if len(c.strip()) > 20]
+
+def simplify_clause(clause):
+    return simplifier(clause, max_length=128)[0]['generated_text']
+
+# --- Corrected Named Entity Extraction ---
+def extract_entities(text):
+    entities = ner_pipeline(text)
+    formatted = []
+    for e in entities:
+        if isinstance(e, dict):
+            entity_type = e.get("entity_group") or e.get("entity") or "UNKNOWN"
+            formatted.append({
+                "entity": entity_type,
+                "word": e.get("word", ""),
+                "start": e.get("start", -1),
+                "end": e.get("end", -1)
+            })
+    return formatted
+
+# --- Document Classification ---
+def classify_doc(text):
+    text_l = text.lower()
+    if "non-disclosure" in text_l or "confidential" in text_l:
+        return "NDA"
+    if "lease" in text_l or "landlord" in text_l:
+        return "Lease"
+    if "employee" in text_l or "employer" in text_l or "salary" in text_l:
+        return "Employment Contract"
+    if "services" in text_l:
+        return "Service Agreement"
+    return "Other"
+
+# --- Main UI ---
+st.title("⚖️ CLAUSE WISE")
+st.markdown(
+    """
+    <div style='font-size:19px; padding-bottom:10px;'>
+    <b>Understand and simplify your legal documents:</b><br>
+    <span style='color:#1f77b4'>→</span> Automated clause breakdown<br>
+    <span style='color:#ffa500'>→</span> Layman summaries<br>
+    <span style='color:#2ca02c'>→</span> Key party/entity extraction<br>
+    <span style='color:#d62728'>→</span> Smart classification
+    </div>
+    """, unsafe_allow_html=True,
+)
+
+if "file_uploaded" not in st.session_state:
+    st.session_state["file_uploaded"] = False
+
+if uploaded:
+    st.session_state["file_uploaded"] = True
+
+if st.session_state["file_uploaded"]:
+    with st.spinner("Processing the document..."):
+        text = extract_text(uploaded)
+        doc_type = classify_doc(text)
+        clauses = get_clauses(text)
+        n_clauses = len(clauses) if clauses else 1
+        n_words = len(text.split())
+        n_chars = len(text)
+        st.success(f"Document classified as: **{doc_type}**")
+
+    met_col1, met_col2, met_col3 = st.columns(3)
+    met_col1.metric("Clauses detected", n_clauses)
+    met_col2.metric("Word count", n_words)
+    met_col3.metric("Character count", n_chars)
+
+    st.markdown("### Document Preview")
+    st.info(text[:1000] + ("..." if len(text) > 1000 else ""))
+
+    st.markdown("## 📃 Clause Browser")
+    selected_clause = st.selectbox(
+        "Choose a clause to analyze",
+        options=clauses if clauses else [text],
+        format_func=lambda c: c[:60].replace("\n", " ") + "..." if len(c) > 60 else c,
+    )
+
+    cl_col1, cl_col2 = st.columns([2, 2])
+    with cl_col1:
+        st.subheader("Original Clause")
+        st.write(selected_clause)
+        st.subheader("Named Entities")
+        ents = extract_entities(selected_clause)
+        if ents:
+            for ent in ents:
+                st.markdown(f"- <b style='color:#1f77b4'>{ent['entity']}</b>: <i>{ent['word']}</i>", unsafe_allow_html=True)
+        else:
+            st.write("No entities detected.")
+
+    with cl_col2:
+        st.subheader("Layman Summary")
+        with st.spinner("Simplifying clause..."):
+            summary = simplify_clause(selected_clause)
+            st.success(summary)
+        st.caption(":bulb: Automated using a Transformer model.")
+
+    st.markdown("## :bar_chart: Full Document Entity Map")
+    ent_tab, clause_tab = st.tabs(["All Entities", "All Clauses"])
+    with ent_tab:
+        doc_ents = extract_entities(text[:2000])
+        if doc_ents:
+            for e in doc_ents:
+                entity_text = text[e["start"]:e["end"]] if 0 <= e["start"] < e["end"] <= len(text) else e["word"]
+                display_text = (entity_text[:40] + "...") if len(entity_text) > 40 else entity_text
+                st.write(f"**{e['entity']}**: {display_text}")
+        else:
+            st.write("No entities found in the sample.")
+    with clause_tab:
+        for idx, c in enumerate(clauses if clauses else [text], 1):
+            st.markdown(f"#### Clause {idx}")
+            st.write(c)
+            st.markdown("---")
+
+    st.success("Analysis complete. Explore your document with the columns, tabs, and browser above!")
+
+else:
+    st.warning("Please upload a legal document using the sidebar to get started.")
